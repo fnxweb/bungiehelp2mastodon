@@ -1,0 +1,489 @@
+#!/bin/bash
+echo Starting bungiehelp2mastodon
+
+# Prep
+debug=false
+nitterhost="http://nitter.fnxweb.co.uk:8082"
+rssurlbase="$nitterhost/__ID__/rss"
+apiurlprefix="https://mastodon.social/api/v1"
+apiurlstatus="$apiurlprefix/statuses"
+apiurlmedia="$apiurlprefix/media"
+curlout=/tmp/_bh2m_$$
+
+[[ "$1" == '--debug' ]]  &&  debug=true
+
+# Local config
+[[ -f bungiehelp2mastodon.config ]]  &&  . bungiehelp2mastodon.config
+
+
+# One cycle
+function process_rss()
+{
+    # ID
+    id="$1"
+    rssurl=${rssurlbase//__ID__/$id}
+    if [[ ! -f curl.$id.token ]];  then
+        echo "error: no curl.$id.token" 1>&2
+        exit 1
+    fi
+    accesstoken=$(<curl.$id.token)
+    header="Authorization: Bearer $accesstoken"
+    cache="cache/$id"
+    images="cache/images"
+    new="$cache/new"
+    tmp="$cache/tmp"
+    [[ -d "$cache" ]]  ||  mkdir -p "$cache"
+    [[ -d "$images" ]]  ||  mkdir -p "$images"
+
+    # Remove old images
+    oldimages=("$images"/*)
+    [[ -f "$oldimages" ]]  &&  rm -f "$images"/*
+
+    # To prevent reposting much older tweets in case the API gives out and only returns best-of data,
+    # reject anything older than the most recent item in the cache (give or take)
+    mostrecent=0
+    for existingfile in "$cache"/*;  do
+        # File is TIMESTAMP.COUNTER
+        existingtime=${existingfile##*/}
+        existingtime=${existingtime%%.*}
+        [[ $existingtime -gt $mostrecent ]]  &&  mostrecent=$existingtime
+    done
+    if $debug;  then
+        if [[ $mostrecent =~ ^[0-9]+$ ]];  then
+            echo "++ Most recent post is $mostrecent - $(date --utc --date=@$mostrecent)"
+        else
+            echo "++ Failed to ID most recent ($mostrecent)"
+        fi
+    fi
+    # Allow a minute's grace - even that may be too much
+    [[ $mostrecent -gt 60 ]]  &&  mostrecent=$((mostrecent-60))
+
+    # Read and process RSS, pulling out any new items
+    rm -f "$new" "$tmp"
+    prevnew=("$cache"/*.new)
+    [[ -f "$prevnew" ]]  &&  rm -f "$cache"/*.new
+    declare -A datesseen
+    datesseen=()
+    datecounter=999
+    date=''
+    intext=false
+    isnew=false
+    rt=''
+    while read line; do
+
+        # Look for date
+        if [[ "$line" =~ ^__DATE: ]];  then
+
+            # Convert date to Julian seconds
+            rawdate=${line#__DATE:}
+            rawdate=$(date +%s --date="$rawdate")
+
+            # Cater for >1 post per second, otherwise we overwrite newer ones in the same second.
+            # NB: counter goes down as posts get older as we see the latest one first.
+            [[ -n "${datesseen[$rawdate]}" ]]  &&  datecounter=$((datecounter-1))  ||  datecounter=999
+            datesseen[$rawdate]='yes'
+            date="$rawdate.$datecounter"
+
+            # Done this one?
+            [[ -f "$cache/$date" ]]  &&  isnew=false  ||  isnew=true
+            if [[ $isnew == 'true'  &&  $rawdate -lt $mostrecent ]];  then
+                $debug  &&  echo "++ post for $rawdate too old, skipping"
+                isnew=false
+            fi
+            [[ $isnew == 'true' ]]  &&  echo $date >> "$new"
+            $debug  &&   echo "++ $date, '$id' isnew=$isnew"
+            continue
+
+        elif [[ "$line" =~ ^__CREATOR: ]];  then
+
+            # Retweet if we're not the creator
+            creator=${line#__CREATOR:@}
+            [[ "$creator" != "$id" ]]  &&  rt="repost from @$creator@twitter.com"
+            continue
+
+        elif [[ "$line" =~ ^__LINK: ]];  then
+
+            # We want to link to the original if it's a rewteet in case of a thread
+            link=${line#__LINK:}
+            continue
+
+        elif [[ "$line" == '__START_DATA__' ]];  then
+
+            # Start text
+            intext=true
+            rm -f "$tmp"
+            continue
+
+        elif [[ "$line" == '__END_DATA__' ]];  then
+
+            # Done
+            [[ -f "$tmp" ]]  &&  mv "$tmp" "$cache/$date.new"
+            date=''
+            intext=false
+            rt=''
+
+        elif [[ $intext == 'true' ]];  then
+
+            # Process this line (new items only)
+            if [[ "$isnew" == 'true'  &&  "$date" != '' ]];  then
+
+                [[ -n "$rt" ]]  &&  echo "[$rt; original: $link]" > "$tmp"
+                rt=''
+
+                line=${line//&lt;/<}
+                line=${line//&gt;/>}
+                line=${line//&amp;/\&}
+                echo $line >> "$tmp"
+
+            fi
+
+        fi
+
+    done < <(curl --silent "$rssurl"  |  xsltproc transform.xsl -)
+
+
+    # Anything to post?
+    if [[ -s "$new" ]];  then
+
+        # Yes, do in date order (this will fail if >10 posts done per second!)
+        for post in $(sort -u $new);  do
+
+            # Remove any counter suffix
+            postdate=${post%.*}
+
+            # Convert date
+            date=$(date --utc --date="@$postdate")
+
+            # Read post, converting from HTML
+            statustext=$(html2text --no-wrap-links --ignore-emphasis --ignore-tables --body-width=0 "$cache/$post.new")
+
+            # Patch markdown [#hashtag](url) to just #hashtag
+            re='^(.*)\[(#[^]]*)\]\([^)]*\)(.*)'
+            while [[ $statustext =~ $re ]];  do
+                statustext="${BASH_REMATCH[1]}${BASH_REMATCH[2]}${BASH_REMATCH[3]}"
+            done
+
+            # Nitter inserts page-link cards (when?);  we don't want those as Mastodon will do it off any
+            # links anyway.  Plus there's an oddity seen where ? != %3F and only the latter works:
+            # good:  http://nitter.net/pic/card_img/1608483801683877891/K1Y8w10S%3Fformat=png&name=1200x627
+            # bad:   http://nitter.net/pic/card_img/1608483801683877891/K1Y8w10S?format=png&name=1200x627
+            re='^(.*)!\[\]\(http://nitter.net/pic/card_img\b[^)]+\) *'$'\n''*(.*)'
+            while [[ $statustext =~ $re ]];  do
+                statustext="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
+            done
+
+            # Remove trailing spaces from each line
+            re='^(.*)  *'$'\n''(.*)'
+            while [[ $statustext =~ $re ]];  do
+                statustext="${BASH_REMATCH[1]}"$'\n'"${BASH_REMATCH[2]}"
+            done
+
+            # Clean up some trailing and triple newlines
+            re=$'\n'$'\n''$'  ## ends in double blank line
+            [[ $statustext =~ $re ]]  ||  statustext="$statustext"$'\n'
+            [[ $statustext =~ $re ]]  ||  statustext="$statustext"$'\n'
+            statustext=${statustext//$'\n'$'\n'$'\n'/$'\n'$'\n'}
+
+            # Make a copy before we remove markdown links and tag the post, so that they are picked up by Discord
+            # TBD not posting images to Discord for now
+            statustext_md="$statustext"
+
+
+            # Image processing;  loop image links
+            mediadata=
+            re='^(.*)!\[\]\(([^)]+)\) *'$'\n''*(.*)'
+            while [[ $statustext =~ $re ]];  do
+                brm1="${BASH_REMATCH[1]}"
+                brm2="${BASH_REMATCH[2]}"
+                brm3="${BASH_REMATCH[3]}"
+
+                # Get URL
+                imageurl="$brm2"
+                filename=${imageurl##*/}
+                filename=${filename//%2F/-}
+
+                # Fetch Nitter-hosted images locally
+                imageurlre='^https?://nitter.net/(.*)'
+                if [[ "$imageurl" =~ $imageurlre ]];  then
+                    imageurl="$nitterhost/${BASH_REMATCH[1]}"
+                fi
+
+                # Get image
+                if [[ "$filename" ]];  then
+                    done=false
+                    attempts=4
+                    while ! $done && [[ $attempts -gt 0 ]];  do
+                        attempts=$((attempts-1))
+                        echo "debug=$debug - $id #$attempts: curl --silent --location '$imageurl' --output '$images/$filename'"
+                        curl --location "$imageurl" --output "$images/$filename"
+                        if [[ -s "$images/$filename" ]];  then
+                            done=true
+                        else
+                            echo "Image download failed..."
+                            sleep 4
+                        fi
+                    done
+                fi
+
+                # Upload it
+                imageok=false
+                if [[ -s "$images/$filename" ]];  then
+                    done=false
+                    attempts=4
+                    while ! $done && [[ $attempts -gt 0 ]];  do
+                        attempts=$((attempts-1))
+                        echo "debug=$debug - $id #$attempts: curl --header '$header' -sS '$apiurlmedia' -X POST --header 'Content-Type: multipart/form-data' --form file='@$images/$filename'"
+                        if ! $debug;  then
+                            curl --header "$header" -sS "$apiurlmedia" -X POST --header "Content-Type: multipart/form-data" --form file="@$images/$filename" > "$curlout"
+                            mediaid=$(jq '.id' "$curlout")
+                            mediaid=${mediaid//\"/}
+                            if [[ "$mediaid" =~ [0-9]+ ]];  then
+                                done=true
+                                echo "++ media uploaded with mediaid=$mediaid"
+                            else
+                                echo "++ media upload failed..."
+                                cat "$curlout"
+                                sleep 15
+                            fi
+                            rm -f "$curlout"
+                        else
+                            done=true
+                            mediaid=12345
+                        fi
+                    done
+
+                    # If it worked, strip the image URL otherwise leave it in
+                    if $done;  then
+                        imageok=true
+                        # Update media args
+                        if [[ "$mediadata" ]];  then
+                            mediadata="$mediadata&media_ids[]=$mediaid"
+                        else
+                            mediadata="--data media_ids[]=$mediaid"
+                        fi
+                    fi
+                fi
+                # TBD batch delete later if needed for Discord
+                [[ -f "$images/$filename" ]]  &&  rm -f "$images/$filename"
+
+                # If it worked, strip the image URL otherwise leave it in
+                if $imageok;  then
+                    statustext="$brm1$brm3"
+                else
+                    statustext="$brm1$brm2 $brm3"
+                fi
+            done
+
+
+            # Patch markdown [text](url) to just url
+            re='^(.*)\[[^]]*\]\(([^)]*)\)(.*)'
+            while [[ $statustext =~ $re ]];  do
+                statustext="${BASH_REMATCH[1]}${BASH_REMATCH[2]}${BASH_REMATCH[3]}"
+            done
+
+            # Tag post with original timestamp and a hashtag
+            posttag=$'\n'"#destiny2"$'\n'"[$date]"
+            posttaglen=$(expr length "$posttag")
+
+            # Remove repeated & fictional blank lines? TBD might now be fixed by better replacements above
+
+            # While nitter.net is down
+            ## [[ "$nitterhost" =~ pvr ]]  &&  statustext="${statustext//http:\/\/nitter.net\//https:\/\/twitter.com\/}"
+
+            # Post to Mastodon - cater for max 500 chars (leave 2 leeway, "(cont.)/" plus space in first for post tag ~40)
+            #   #destiny2/[Mon Sep 18 06:31:57 UTC 2023]
+            maxlen=$((490-$posttaglen))
+
+            # While still stuff to post, work through lines/sentences of post
+            fullstatustext="$statustext"
+            fulllen=$(expr length "$fullstatustext")
+            statustext=
+            len=0
+            safety=0
+            donetag=false
+            postid=
+            spaceornlre='^[ '$'\n'']'
+            while [[ "$fulllen" -gt 0 && $safety -lt 4 ]];  do
+
+                dopost=false
+
+                # Split on newline / . (temporarily, need to check next char after a . is not a letter/number, e.g. vn or URL)
+                re='^([^.'$'\n'']+)([.'$'\n''])(.*)'
+                mustadd=false
+                if [[ "$fullstatustext" =~ $re ]];  then
+                    # Split on newline
+                    line="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
+                    rest="${BASH_REMATCH[3]}"
+                    # Prevent use of this split if . followed by non-space / newline
+                    [[ "$line" =~ \.$  &&  ! "$rest" =~ $spaceornlre ]]  &&  mustadd=true
+                else
+                    # Use what's left - TBD lines that are too long with no newlines to split on
+                    line="$fullstatustext"
+                    rest=
+                fi
+
+                # Add?
+                linelen=$(expr length "$line")
+                if $mustadd  ||  [[ $((len+linelen)) -lt $maxlen ]];  then
+                    # Line can/must be added, then try next
+                    statustext="$statustext$line"
+                    fullstatustext="$rest"
+                    len=$(expr length "$statustext")
+                else
+                    # Line would be too much, post now
+                    statustext="${statustext%% }"
+                    # Only put (cont.) hint in first post, otherwise change new maxlen below
+                    $donetag || statustext="$statustext"$'\n'"(cont.)"
+                    dopost=true
+                fi
+
+                # Recalculate outstanding length
+                fulllen=$(expr length "$fullstatustext")
+
+                # Post is required or finished
+                if $dopost || [[ $len -gt 0 && $fulllen -eq 0 ]];  then
+
+                    # Add the tag now if not yet done (only on first part of split posts)
+                    statustext=${statustext%%$'\n'}
+                    if ! $donetag;  then
+                        statustext="$statustext"$'\n'
+                        statustext="$statustext$posttag"
+                        donetag=true
+                        maxlen=$((500-2))
+                    fi
+
+                    # Reply to previous parts
+                    postiddata=
+                    [[ "$postid" =~ [0-9]+ ]]  &&  postiddata="--data in_reply_to_id='$postid'"
+
+                    # Actually do a post
+                    safety=$((safety+1))
+                    done=false
+                    attempts=10
+                    while ! $done && [[ $attempts -gt 0 ]];  do
+                        attempts=$((attempts-1))
+                        if [[ $attempts -eq 0 ]];  then
+                            echo "Giving up trying to reply, try to post normally"
+                            postiddata=
+                        fi
+                        echo "debug=$debug - $id #$attempts: curl --header '$header' -sS '$apiurlstatus' -X POST --data-urlencode 'status=$statustext' --data 'language=eng' --data 'visibility=public' $mediadata $postiddata"
+                        if ! $debug;  then
+                            # Really do it
+                            curl --header "$header" -sS "$apiurlstatus" -X POST --data-urlencode "status=$statustext" --data 'language=eng' --data 'visibility=public' $mediadata $postiddata > "$curlout"
+                            postid=$(jq '.id' "$curlout")
+                            postid=${postid//\"/}
+                            if [[ "$postid" =~ [0-9]+ ]];  then
+                                done=true
+                                echo "++ posted with postid=$postid"
+                            else
+                                echo "++ post upload failed..."
+                                cat "$curlout"
+                                sleep 60
+                            fi
+                            rm -f "$curlout"
+                        else
+                            [[ ! "$postid" ]]  &&  postid=12345  ||  postid=$((postid+1))
+                            done=true
+                        fi
+                    done
+
+                    # If done and not debug, wait for post to become available if there is more to do
+                    if $done && ! $debug && [[ $fulllen -gt 0 ]];  then
+                        done=false
+                        attempts=20
+                        while ! $done && [[ $attempts -gt 0 ]];  do
+                            echo "Waiting for post $postid to become active ... ($attempts)"
+                            sleep 15
+                            attempts=$((attempts-1))
+                            checkid=$(curl -sS "$apiurlstatus/$postid" | jq '.id')
+                            checkid=${checkid//\"/}
+                            [[ "$checkid" =~ [0-9]+ ]]  &&  done=true
+                        done
+                        if $done;  then
+                            echo "Seem to have found it at $checkid but waiting another 30s anyway"
+                            sleep 30
+                        fi
+                    fi
+
+                    # Cycle to next bit of post if any - only do images on the first one
+                    mediadata=
+                    statustext=
+                    len=0
+                fi
+
+            done
+
+            $debug || echo
+            mv -f "$cache/$post.new" "$cache/$post"
+
+            # Optionally, also post to Discord
+            if [[ -f curl.$id.discord ]];  then
+
+                # Webhook
+                discord_webhook=$(<curl.$id.discord)
+
+                # Fix markdown [text](url) to include the URL if text is empty (otherwise link doesn't show)
+                # Update:  Discord no longer allows URLs in the description, so just use "image".
+                re='^(.*)\[\]\(([^)]*)\)(.*)'
+                while [[ $statustext_md =~ $re ]];  do
+                    statustext_md="${BASH_REMATCH[1]}[image](${BASH_REMATCH[2]})${BASH_REMATCH[3]}"
+                done
+
+                # This is JSON, so escape quotes first
+                statustext_md=${statustext_md//\"/\\\"}
+
+                # No newlines in JSON
+                statustext_md=${statustext_md//$'\n'/\\n}
+
+                # While nitter.net is down
+                ## [[ "$nitterhost" =~ pvr ]]  &&  statustext_md="${statustext_md//http:\/\/nitter.net\//https:\/\/twitter.com\/}"
+
+                # Do it
+                discord_json="{\"content\": \"[$date]\", \"embeds\": [{ \"author\": {\"name\": \"$id\"}, \"description\": \"$statustext_md\" }]}"
+                ## discord_json="{\"content\": \"[$(date)]\", \"embeds\": [{ \"author\": {\"name\": \"$id\"}, \"description\": \"$statustext_md\"}, {\"image\": {\"url\": \"https://nitter.net/pic/media/F1Fg9ogXwAEaPKO.jpg\"}}]}"
+                echo "debug=$debug: curl -H 'Content-Type: application/json' -d '$discord_json' '$discord_webhook'"
+                if ! $debug;  then
+                    curl -H "Content-Type: application/json" -d "$discord_json" "$discord_webhook"
+                    echo
+                fi
+            fi
+
+        done
+
+    fi
+    rm -f "$new"
+
+
+    # Purge old - keep 100
+    cached=("$cache"/*)
+    if [[ -f "$cached" ]];  then
+        ls -t "$cache"/* | awk 'NR>100' | xargs rm -f
+    fi
+}
+
+
+# Find accounts from given tokens
+tokenfiles=(curl.*.token)
+if [[ ! -f "${tokenfiles[0]}" ]];  then
+    echo "error: curl token files not found"  1>&2
+    exit 1
+fi
+
+declare -a accounts
+count="${#tokenfiles[@]}"
+for ((idx=0; idx<$count; ++idx));  do
+    account="${tokenfiles[$idx]}"
+    [[ $account =~ .*\.(.*)\..* ]]  &&  account="${BASH_REMATCH[1]}"
+    accounts[$idx]="$account"
+done
+
+# Do it
+while true;  do
+    for account in "${accounts[@]}";  do
+        process_rss "$account"
+    done
+    $debug  &&  exit
+    sleep $((5*60))
+done
+
+# vim: set sts=4 sw=4 ai et :
