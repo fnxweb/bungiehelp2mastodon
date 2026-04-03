@@ -1,3 +1,6 @@
+# THIS REPO HAS BEEN RELOCATED
+The new location is https://codeberg.org/fnxweb/bungiehelp2mastodon
+___
 # bungiehelp2mastodon
 Infrequently updated copy of my Twitter-to-Mastodon bash script (held in local Gitea) with local/history removed.
 
